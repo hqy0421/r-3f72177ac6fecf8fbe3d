@@ -41,6 +41,7 @@ from dbt.adapters.capability import Support
 from dbt.adapters.contracts.connection import AdapterResponse
 from dbt.adapters.contracts.relation import Path
 from dbt.adapters.contracts.relation import RelationType
+from dbt.adapters.duckdb.change_stream import ChangeStreamAdapterMixin
 from dbt.adapters.duckdb.column import DuckDBColumn
 from dbt.adapters.duckdb.connections import DuckDBConnectionManager
 from dbt.adapters.duckdb.relation import DuckDBRelation
@@ -96,7 +97,7 @@ class DuckDBConfig(AdapterConfig):
     indexes: Optional[List[DuckDBIndexConfig]] = None
 
 
-class DuckDBAdapter(SQLAdapter):
+class DuckDBAdapter(ChangeStreamAdapterMixin, SQLAdapter):
     ConnectionManager = DuckDBConnectionManager
     Column = DuckDBColumn
     Relation = DuckDBRelation
