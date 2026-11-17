@@ -1,0 +1,204 @@
+import os
+import tempfile
+
+import duckdb
+import pytest
+
+from dbt.adapters.duckdb import DuckDBConnectionManager
+from dbt.tests.util import run_dbt
+
+sources_schema_yml = """
+version: 2
+sources:
+  - name: attached_source
+    database: attach_test
+    schema: analytics
+    tables:
+      - name: attached_table
+        description: "An attached table"
+        columns:
+          - name: id
+            description: "An id"
+            tests:
+              - unique
+              - not_null
+"""
+
+models_source_model_sql = """
+    select * from {{ source('attached_source', 'attached_table') }}
+"""
+
+models_target_model_sql = """
+    {{ config(materialized='table', database='attach_test') }}
+    SELECT * FROM {{ ref('source_model') }}
+"""
+
+
+@pytest.mark.skip_profile("memory", "buenavista", "md")
+class TestAttachedDatabase:
+    @pytest.fixture(scope="class")
+    def attach_test_db(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = os.path.join(temp_dir, "attach_test.duckdb")
+            db = duckdb.connect(path)
+            db.execute("CREATE SCHEMA analytics")
+            db.execute("CREATE TABLE analytics.attached_table AS SELECT 1 as id")
+            db.close()
+            yield path
+
+    @pytest.fixture(scope="class")
+    def profiles_config_update(self, dbt_profile_target, attach_test_db):
+        return {
+            "test": {
+                "outputs": {
+                    "dev": {
+                        "type": "duckdb",
+                        "path": dbt_profile_target.get("path", ":memory:"),
+                        "attach": [{"path": attach_test_db}],
+                    }
+                },
+                "target": "dev",
+            }
+        }
+
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {
+            "schema.yml": sources_schema_yml,
+            "source_model.sql": models_source_model_sql,
+            "target_model.sql": models_target_model_sql,
+        }
+
+    def test_attached_databases(self, project, attach_test_db):
+        results = run_dbt()
+        assert len(results) == 2
+
+        test_results = run_dbt(["test"])
+        assert len(test_results) == 2
+
+        DuckDBConnectionManager.close_all_connections()
+
+        # check that the model is created in the attached db
+        db = duckdb.connect(attach_test_db)
+        ret = db.execute("SELECT * FROM target_model").fetchall()
+        assert ret[0][0] == 1
+        db.close()
+
+        # check that everything works on a re-run of dbt
+        rerun_results = run_dbt()
+        assert len(rerun_results) == 2
+
+
+indexed_model_sql = """
+    {{ config(
+        materialized='table',
+        database='attach_test',
+        indexes=[{'columns': ['id']}],
+    ) }}
+    SELECT 1 as id
+"""
+
+
+@pytest.mark.skip_profile("memory", "buenavista", "md")
+class TestIndexOnAttachedDatabase:
+    """Regression test for #771: dropping indexes on a table in an attached
+    (non-default) catalog requires the full three-part database.schema.index
+    path. The second dbt run exercises the DROP INDEX path in
+    drop_indexes_on_relation."""
+
+    @pytest.fixture(scope="class")
+    def attach_test_db(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = os.path.join(temp_dir, "attach_test.duckdb")
+            db = duckdb.connect(path)
+            db.close()
+            yield path
+
+    @pytest.fixture(scope="class")
+    def profiles_config_update(self, dbt_profile_target, attach_test_db):
+        return {
+            "test": {
+                "outputs": {
+                    "dev": {
+                        "type": "duckdb",
+                        "path": dbt_profile_target.get("path", ":memory:"),
+                        "attach": [{"path": attach_test_db}],
+                    }
+                },
+                "target": "dev",
+            }
+        }
+
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {"indexed_model.sql": indexed_model_sql}
+
+    def test_index_on_attached_database(self, project):
+        # First run creates the table + index (no DROP INDEX path).
+        results = run_dbt()
+        assert len(results) == 1
+
+        # Second run re-materializes the table, which drops the existing
+        # index first. Without the database_name prefix this fails with
+        # "Catalog Error: Index ... does not exist!".
+        rerun_results = run_dbt()
+        assert len(rerun_results) == 1
+
+
+target_db_model_sql = """
+    {{ config(materialized='table') }}
+    SELECT 1 as id
+"""
+
+
+@pytest.mark.skip_profile("memory", "buenavista", "md")
+class TestAttachedDatabaseAsTarget:
+    """The profile's `database` may name an attached database. Without an alias the
+    attachment is registered under the name DuckDB derives from its path, and the
+    profile must accept that name just as it accepts an alias."""
+
+    @pytest.fixture(scope="class")
+    def attach_test_db(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = os.path.join(temp_dir, "attach_test.duckdb")
+            db = duckdb.connect(path)
+            db.close()
+            yield path
+
+    @pytest.fixture(scope="class")
+    def profiles_config_update(self, dbt_profile_target, attach_test_db):
+        return {
+            "test": {
+                "outputs": {
+                    "dev": {
+                        "type": "duckdb",
+                        "path": dbt_profile_target.get("path", ":memory:"),
+                        "database": "attach_test",
+                        "attach": [{"path": attach_test_db}],
+                    }
+                },
+                "target": "dev",
+            }
+        }
+
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {"target_db_model.sql": target_db_model_sql}
+
+    def test_models_land_in_attached_database(self, project, attach_test_db):
+        results = run_dbt()
+        assert len(results) == 1
+
+        DuckDBConnectionManager.close_all_connections()
+
+        # the model lands in the attached database, not in the one named by `path`
+        db = duckdb.connect(attach_test_db)
+        try:
+            ret = db.execute("SELECT id FROM target_db_model").fetchall()
+        finally:
+            db.close()
+        assert ret == [(1,)]
+
+        # re-running against the attached target works as well
+        rerun_results = run_dbt()
+        assert len(rerun_results) == 1

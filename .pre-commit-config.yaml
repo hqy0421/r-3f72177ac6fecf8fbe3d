@@ -1,0 +1,52 @@
+# For more on configuring pre-commit hooks (see https://pre-commit.com/)
+
+# TODO: remove global exclusion of tests when testing overhaul is complete
+exclude: "^tests/.*"
+
+
+default_language_version:
+  python: python3.11
+
+repos:
+- repo: https://github.com/pre-commit/pre-commit-hooks
+  rev: v6.0.0
+  hooks:
+  - id: check-yaml
+    args: [--unsafe]
+  - id: check-json
+  - id: end-of-file-fixer
+  - id: trailing-whitespace
+  - id: check-case-conflict
+- repo: https://github.com/asottile/reorder_python_imports
+  rev: v3.19.0
+  hooks:
+  -  id: reorder-python-imports
+- repo: local
+  hooks:
+  - id: ruff
+    name: ruff
+    entry: uv run ruff check --force-exclude --fix
+    language: system
+    types_or: [python, pyi]
+    require_serial: true
+  - id: ruff-format
+    name: ruff-format
+    entry: uv run ruff format --force-exclude
+    language: system
+    types_or: [python, pyi]
+    require_serial: true
+  - id: mypy
+    name: mypy
+    entry: uv run mypy --show-error-codes --ignore-missing-imports
+    language: system
+    types_or: [python, pyi]
+    files: ^dbt/adapters/.*
+    require_serial: true
+  - id: mypy-check
+    name: mypy (pretty)
+    stages: [manual]
+    entry: uv run mypy --show-error-codes --pretty --ignore-missing-imports
+    language: system
+    types_or: [python, pyi]
+    files: ^dbt/adapters
+    require_serial: true

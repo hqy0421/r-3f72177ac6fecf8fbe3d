@@ -1,0 +1,99 @@
+import unittest
+from argparse import Namespace
+from unittest import mock
+
+from dbt.flags import set_from_args
+from dbt_common.exceptions import CompilationError
+from dbt.adapters.duckdb import DuckDBAdapter
+from tests.unit.utils import config_from_parts_or_dicts
+
+class TestExternalUtils(unittest.TestCase):
+    def setUp(self):
+        set_from_args(Namespace(STRICT_MODE=True), {})
+
+        profile_cfg = {
+            "outputs": {
+                "test": {
+                    "type": "duckdb",
+                    "path": ":memory:",
+                }
+            },
+            "target": "test",
+        }
+
+        project_cfg = {
+            "name": "X",
+            "version": "0.1",
+            "profile": "test",
+            "project-root": "/tmp/dbt/does-not-exist",
+            "config-version": 2,
+        }
+
+        self.config = config_from_parts_or_dicts(project_cfg, profile_cfg, cli_vars={})
+        self._adapter = None
+
+    @property
+    def adapter(self):
+        self.mock_mp_context = mock.MagicMock()
+        if self._adapter is None:
+            self._adapter = DuckDBAdapter(self.config, self.mock_mp_context)
+        return self._adapter
+
+    def test_external_write_options(self):
+        data = [
+            ("/tmp/test.csv", {}, "format csv, header 1"),
+            ("./foo.parquet", {"codec": "zstd"}, "codec zstd, format parquet"),
+            ("bar", {"delimiter": "|", "header": "0"}, "delimiter '|', header 0, format csv"),
+            ("a.parquet", {"partition_by": "ds"}, "partition_by ds, format parquet"),
+            ("b.csv", {"partition_by": "ds,category"}, "partition_by (ds,category), format csv, header 1"),
+            ("/path/to/c.csv", {"null": "\\N"}, "null '\\N', format csv, header 1"),
+            ("/tmp/d.csv.gz", {}, "format csv, compression gzip, header 1"),
+            ("e.json.zst", {}, "format json, compression zstd"),
+            ("/tmp/F.CSV.GZ", {}, "format csv, compression gzip, header 1"),
+            ("g.csv.gz", {"compression": "none"}, "compression none, format csv, header 1"),
+            ("h", {"FORMAT": "csv"}, "format csv, header 1"),
+            ("i.csv", {"Delimiter": "|", "HEADER": "0"}, "delimiter '|', header 0, format csv"),
+            ("j", {"PARTITION_BY": "ds,category"}, "partition_by (ds,category), format parquet"),
+        ]
+
+        for (loc, opts, expected) in data:
+            assert expected == self.adapter.external_write_options(loc, opts)
+    
+
+    def test_external_read_location(self):
+        data = [
+            ("bar", {"format": "csv", "delimiter": "|", "header": "0"}, "bar"),
+            ("/tmp/a", {"partition_by": "ds", "format": "parquet"}, "/tmp/a/*/*.parquet"),
+            ("b", {"partition_by": "ds,category"}, "b/*/*/*.parquet"),
+            ("c", {"PARTITION_BY": "ds", "FORMAT": "csv"}, "c/*/*.csv"),
+            ("d", {"Per_Thread_Output": "true"}, "d/*.parquet"),
+            # DuckDB appends the compression extension to CSV and JSON files
+            ("e", {"partition_by": "ds", "format": "csv", "compression": "gzip"}, "e/*/*.csv.gz"),
+            ("f", {"per_thread_output": "true", "format": "json", "compression": "zstd"}, "f/*.json.zst"),
+            ("g", {"PARTITION_BY": "ds", "FORMAT": "csv", "COMPRESSION": "GZIP"}, "g/*/*.csv.gz"),
+            # a quoted value, as written in options={"compression": "'gzip'"}
+            ("g2", {"partition_by": "ds", "format": "csv", "compression": "'gzip'"}, "g2/*/*.csv.gz"),
+            ("g3", {"per_thread_output": "true", "format": "json", "compression": '"zstd"'}, "g3/*.json.zst"),
+            # but not to Parquet, which compresses internally
+            ("h", {"partition_by": "ds", "format": "parquet", "compression": "gzip"}, "h/*/*.parquet"),
+            ("i", {"partition_by": "ds", "format": "csv", "compression": "none"}, "i/*/*.csv"),
+            ("j", {"partition_by": "ds", "format": "csv", "compression": "auto"}, "j/*/*.csv"),
+            # file_extension replaces the format's extension
+            ("k", {"partition_by": "ds", "format": "csv", "file_extension": "txt"}, "k/*/*.txt"),
+            ("l", {"partition_by": "ds", "format": "csv", "file_extension": ".txt", "compression": "gzip"}, "l/*/*.txt.gz"),
+            ("m", {"partition_by": "ds", "format": "csv", "file_extension": "txt.gz", "compression": "gzip"}, "m/*/*.txt.gz"),
+        ]
+        for (loc, opts, expected) in data:
+            assert expected == self.adapter.external_read_location(loc, opts), (loc, opts)
+
+    def test_external_write_options_normalizes_keys_in_place(self):
+        # the external materialization reads the format and compression back from the dict
+        opts = {"FORMAT": "CSV", "COMPRESSION": "gzip"}
+        self.adapter.external_write_options("out", opts)
+        assert opts == {"format": "CSV", "compression": "gzip"}
+
+    def test_external_write_options_rejects_keys_that_differ_only_by_case(self):
+        # render_write_options adds the legacy top-level format after the options dict
+        opts = {"FORMAT": "parquet", "format": "csv"}
+        with self.assertRaisesRegex(CompilationError, "'FORMAT' and 'format'"):
+            self.adapter.external_write_options("out", opts)

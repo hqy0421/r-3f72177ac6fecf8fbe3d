@@ -1,0 +1,514 @@
+import os
+from dataclasses import dataclass
+from dataclasses import field
+from typing import Any
+from typing import Dict
+from typing import List
+from typing import Optional
+from typing import Union
+from urllib.parse import urlparse
+
+from dbt_common.dataclass_schema import dbtClassMixin
+from dbt_common.exceptions import DbtRuntimeError
+
+from dbt.adapters.contracts.connection import Credentials
+from dbt.adapters.duckdb.secrets import DEFAULT_SECRET_PREFIX
+from dbt.adapters.duckdb.secrets import Secret
+from dbt.adapters.duckdb.utils import escape_sql_string
+
+MOTHERDUCK_SCHEMES = {"md", "motherduck"}
+
+# Attachment types whose catalog is stored by DuckDB itself. When such an attachment
+# has no alias, DuckDB registers it under the name derived from its path, so the
+# profile's `database` may refer to it by that name. For other types (postgres,
+# sqlite, ...) the path is a DSN or a foreign file and the registered name is not
+# reliably path-derived, so those attachments must be aliased to be targeted.
+DUCKDB_BACKED_ATTACHMENT_TYPES = {"duckdb", "ducklake"}
+
+
+@dataclass
+class Attachment(dbtClassMixin):
+    # The path to the database to be attached (may be a URL)
+    path: str
+
+    # The type of the attached database (defaults to duckdb, but may be supported by an extension)
+    type: Optional[str] = None
+
+    # An optional alias for the attached database
+    alias: Optional[str] = None
+
+    # An optional reference to a secret name from the secret manager
+    secret: Optional[str] = None
+
+    # Whether the attached database is read-only or read/write
+    read_only: bool = False
+
+    # Arbitrary key-value pairs for additional ATTACH options
+    options: Optional[Dict[str, Any]] = None
+
+    # An optional flag to indicate whether the database is a ducklake database,
+    # so that the adapter can generate queries that work for ducklake.
+    # This is not always necessary when using a ducklake database, but
+    # serves more as a hint for cases where the path does not use the ducklake: scheme,
+    # which is the case in fully managed ducklake in MotherDuck.
+    is_ducklake: Optional[bool] = None
+
+    def to_sql(self) -> str:
+        # remove query parameters from MotherDuck paths (not supported in ATTACH)
+        path = self.path
+        parsed = urlparse(path)
+        if parsed.scheme in MOTHERDUCK_SCHEMES:
+            path = path.split("?", 1)[0]
+        base = f"ATTACH IF NOT EXISTS '{escape_sql_string(path)}'"
+        if self.alias:
+            base += f" AS {self.alias}"
+
+        # Check for conflicts between legacy fields and options dict
+        if self.options:
+            conflicts = []
+            if self.type and "type" in self.options:
+                conflicts.append("type")
+            if self.secret and "secret" in self.options:
+                conflicts.append("secret")
+            if self.read_only and "read_only" in self.options:
+                conflicts.append("read_only")
+
+            if conflicts:
+                raise DbtRuntimeError(
+                    f"Attachment option(s) {conflicts} specified in both direct fields and options dict. "
+                    f"Please specify each option in only one location."
+                )
+
+        # Collect all options, prioritizing direct fields over options dict
+        all_options = []
+
+        # Add legacy options for backward compatibility
+        if self.type:
+            all_options.append(f"TYPE {self.type}")
+        elif self.options and "type" in self.options:
+            all_options.append(f"TYPE {self.options['type']}")
+
+        if self.secret:
+            all_options.append(f"SECRET {self.secret}")
+        elif self.options and "secret" in self.options:
+            all_options.append(f"SECRET {self.options['secret']}")
+
+        if self.read_only:
+            all_options.append("READ_ONLY")
+        elif self.options and "read_only" in self.options and self.options["read_only"]:
+            all_options.append("READ_ONLY")
+
+        # Add arbitrary options from the options dict (excluding handled ones)
+        if self.options:
+            handled_keys = {"type", "secret", "read_only"}
+            for key, value in self.options.items():
+                if key in handled_keys:
+                    continue
+
+                # Format the option appropriately
+                if isinstance(value, bool):
+                    if value:  # Only add boolean options if they're True
+                        all_options.append(key.upper())
+                elif value is not None:
+                    # Quote string values for DuckDB SQL compatibility
+                    if isinstance(value, str):
+                        # Only quote if not already quoted (single or double quotes)
+                        stripped_value = value.strip()
+                        if len(stripped_value) >= 2 and (
+                            (stripped_value.startswith("'") and stripped_value.endswith("'"))
+                            or (stripped_value.startswith('"') and stripped_value.endswith('"'))
+                        ):
+                            all_options.append(f"{key.upper()} {value}")
+                        else:
+                            all_options.append(f"{key.upper()} '{escape_sql_string(value)}'")
+                    else:
+                        all_options.append(f"{key.upper()} {value}")
+
+        if all_options:
+            joined = ", ".join(all_options)
+            base += f" ({joined})"
+        return base
+
+
+@dataclass
+class PluginConfig(dbtClassMixin):
+    module: str
+
+    alias: Optional[str] = None
+
+    # A plugin-specific set of configuration options
+    config: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class Remote(dbtClassMixin):
+    host: str
+    port: int
+    user: str
+    password: Optional[str] = None
+
+
+@dataclass
+class Retries(dbtClassMixin):
+    # The number of times to attempt the initial duckdb.connect call
+    # (to wait for another process to free the lock on the DB file)
+    connect_attempts: int = 1
+
+    # The number of times to attempt to execute a DuckDB query that throws
+    # one of the retryable exceptions
+    query_attempts: Optional[int] = None
+
+    # The list of exceptions that we are willing to retry on
+    retryable_exceptions: List[str] = field(default_factory=lambda: ["IOException"])
+
+
+@dataclass
+class Extension(dbtClassMixin):
+    name: str
+    repo: str
+
+
+@dataclass
+class FlightConfig(dbtClassMixin):
+    """Settings for running Python models on MotherDuck Flights.
+    Only consulted for models submitted with `submission_method: flight`.
+    """
+
+    # Submit every Python model to a Flight. Models can opt back out with
+    # `submission_method: local`.
+    enabled_by_default: bool = False
+
+    # Label of the MotherDuck access token the Flight uses at runtime; its
+    # scope must cover every database the model touches. The runtime injects
+    # it as MOTHERDUCK_TOKEN, a reserved variable, so the token from
+    # `path`/`config_options` cannot be forwarded instead. Defaults to
+    # MotherDuck's built-in Flights token.
+    access_token_name: Optional[str] = None
+
+    # Per-run timeout enforced by MotherDuck; 0 means none, None the plan default.
+    max_runtime_sec: Optional[int] = None
+
+    # Runner size for every Flight: F4, F16 or F32, named after the runner's
+    # memory in GB. None uses the plan default (F16, or the plan cap when that
+    # is smaller). A model can override this with `instance_type` in its config.
+    instance_type: Optional[str] = None
+
+    # How long dbt waits for a run before cancelling it.
+    timeout_sec: int = 3600
+
+    # How often to poll a running Flight.
+    poll_interval_sec: float = 2.0
+
+    # Lines of a failed run's log to inline in the dbt error. A Flight log
+    # includes the whole dependency install, so this defaults to off and the
+    # error points at the log instead.
+    log_lines: int = 0
+
+    # Overrides the MotherDuck UI link to a run's logs; takes {flight_id} and
+    # {run_number}.
+    log_url_template: Optional[str] = None
+
+    # Requirements added to every Flight, on top of each model's `packages`.
+    requirements: Optional[List[str]] = None
+
+    # Version to pin `duckdb` to inside the Flight; defaults to the local
+    # client's version, which MotherDuck is known to accept.
+    duckdb_version: Optional[str] = None
+
+
+@dataclass
+class DuckDBCredentials(Credentials):
+    database: str = "main"
+    schema: str = "main"
+    path: str = ":memory:"
+
+    # Any connection-time configuration information that we need to pass
+    # to DuckDB (e.g., if we need to enable using unsigned extensions)
+    config_options: Optional[Dict[str, Any]] = None
+
+    # any DuckDB extensions we want to install and load (httpfs, parquet, etc.)
+    extensions: Optional[List[Union[str, Dict[str, str]]]] = None
+
+    # any additional pragmas we want to configure on our DuckDB connections;
+    # a list of the built-in pragmas can be found here:
+    # https://duckdb.org/docs/sql/configuration
+    # (and extensions may add their own pragmas as well)
+    settings: Optional[Dict[str, Any]] = None
+
+    # secrets for connecting to cloud services AWS S3, Azure, Cloudfare R2,
+    # Google Cloud and Huggingface.
+    secrets: Optional[List[Dict[str, Any]]] = None
+
+    # the root path to use for any external materializations that are specified
+    # in this dbt project; defaults to "." (the current working directory)
+    external_root: str = "."
+
+    # identify whether to use the default credential provider chain for AWS/GCloud
+    # instead of statically defined environment variables
+    use_credential_provider: Optional[str] = None
+
+    # A list of additional databases that should be attached to the running
+    # DuckDB instance to make them available for use in models; see the
+    # schema for the Attachment dataclass above for what fields it can contain
+    attach: Optional[List[Attachment]] = None
+
+    # A list of filesystems to attach to the DuckDB database via the fsspec
+    # interface; see https://duckdb.org/docs/guides/python/filesystems.html
+    #
+    # Each dictionary entry must have a "fs" entry to indicate which
+    # fsspec implementation should be loaded, and then an arbitrary additional
+    # number of key-value pairs that will be passed as arguments to the fsspec
+    # registry method.
+    filesystems: Optional[List[Dict[str, Any]]] = None
+
+    # Used to configure remote environments/connections
+    remote: Optional[Remote] = None
+
+    # A list of dbt-duckdb plugins that can be used to customize the
+    # behavior of loading source data and/or storing the relations that are
+    # created by SQL or Python models; see the plugins module for more details.
+    plugins: Optional[List[PluginConfig]] = None
+
+    # Whether to disable transactions when executing SQL statements; this
+    # is useful when we would like the resulting DuckDB database file to
+    # be as small as possible.
+    disable_transactions: bool = False
+
+    # Whether to keep the DuckDB connection open between invocations of dbt
+    keep_open: bool = True
+
+    # A list of paths to Python modules that should be loaded into the
+    # running Python environment when dbt is invoked; this is useful for
+    # loading custom dbt-duckdb plugins or locally defined modules that
+    # provide helper functions for dbt Python models.
+    module_paths: Optional[List[str]] = None
+
+    # An optional strategy for allowing retries when certain types of
+    # exceptions occur on a model run (e.g., IOExceptions that were caused
+    # by networking issues)
+    retries: Optional[Retries] = None
+
+    # Settings for running Python models on MotherDuck Flights instead of in
+    # the local dbt process; see the FlightConfig dataclass above. Deliberately
+    # absent from _connection_keys(), which dbt logs: access_token_name names a
+    # MotherDuck token and does not belong in the output.
+    flights: Optional[FlightConfig] = None
+
+    # An optional flag to indicate whether the database is a ducklake database,
+    # so that the adapter can generate queries that work for ducklake.
+    # This is not always necessary when using a ducklake database, but
+    # serves more as a hint for cases where the path does not use the ducklake: scheme,
+    # which is the case in fully managed ducklake in MotherDuck.
+    is_ducklake: Optional[bool] = None
+
+    # The access token to use when connecting to MotherDuck (i.e., when the
+    # path or an attached database uses the md: scheme); equivalent to
+    # setting motherduck_token in the settings dictionary.
+    motherduck_token: Optional[str] = None
+
+    def __post_init__(self):
+        self.settings = self.settings or {}
+
+        if self.motherduck_token:
+            existing_token = self.settings.get("motherduck_token")
+            if existing_token is not None and existing_token != self.motherduck_token:
+                raise DbtRuntimeError(
+                    "Conflicting values for motherduck_token found in the profile; "
+                    "please set it in only one place"
+                )
+            self.settings["motherduck_token"] = self.motherduck_token
+        self.secrets = self.secrets or []
+        self._secrets = []
+
+        # Build set of ducklake database names for efficient lookup
+        self._ducklake_dbs = set()
+
+        if self.is_ducklake or "ducklake:" in self.path.lower():
+            self._ducklake_dbs.add(self.path_derived_database_name(self.path))
+
+        if self.attach:
+            for attachment in self.attach:
+                is_ducklake_flag = getattr(attachment, "is_ducklake", None)
+                path = getattr(attachment, "path", None)
+                alias = getattr(attachment, "alias", None)
+                attach_type = getattr(attachment, "type", None)
+                if attach_type is None:
+                    attach_type = (getattr(attachment, "options", None) or {}).get("type")
+
+                # Detect ducklake by the is_ducklake flag, the attachment type
+                # (ATTACH ... (TYPE ducklake)), or the path scheme. Be lenient on case.
+                if (
+                    (isinstance(is_ducklake_flag, bool) and is_ducklake_flag)
+                    or (isinstance(attach_type, str) and attach_type.lower() == "ducklake")
+                    or (isinstance(path, str) and "ducklake:" in path.lower())
+                ):
+                    if alias:
+                        self._ducklake_dbs.add(alias)
+                    else:
+                        self._ducklake_dbs.add(self.path_derived_database_name(path))
+
+        # Add MotherDuck plugin if the path is a MotherDuck database
+        # and plugin was not specified in profile.yml
+        if self.is_motherduck:
+            if self.plugins is None:
+                self.plugins = []
+            if "motherduck" not in [plugin.module for plugin in self.plugins]:
+                self.plugins.append(PluginConfig(module="motherduck"))
+
+        # For backward compatibility, to be deprecated in the future
+        if self.use_credential_provider:
+            if self.use_credential_provider == "aws":
+                self.secrets.append({"type": "s3", "provider": "credential_chain"})
+            else:
+                raise ValueError(
+                    "Unsupported value for use_credential_provider: "
+                    + self.use_credential_provider
+                )
+
+        if self.secrets:
+            self._secrets = [
+                Secret.create(
+                    secret_type=secret.pop("type"),
+                    name=secret.pop("name", f"{DEFAULT_SECRET_PREFIX}{num + 1}"),
+                    **secret,
+                )
+                for num, secret in enumerate(self.secrets)
+            ]
+
+    def secrets_sql(self) -> List[str]:
+        return [secret.to_sql() for secret in self._secrets]
+
+    @property
+    def motherduck_attach(self):
+        # Check if any MotherDuck paths are attached
+        attach = []
+        for attached_db in self.attach or []:
+            parsed = urlparse(attached_db.path)
+            if self._is_motherduck(parsed.scheme):
+                attach.append(attached_db)
+        return attach
+
+    @property
+    def is_motherduck_attach(self):
+        return len(self.motherduck_attach) > 0
+
+    @property
+    def is_motherduck_database(self):
+        # Whether the *primary* connection (as opposed to an attached database)
+        # is a MotherDuck database; only these connections are registered with
+        # MotherDuck's instance cache.
+        parsed = urlparse(self.path)
+        return self._is_motherduck(parsed.scheme)
+
+    @property
+    def is_motherduck(self):
+        return self.is_motherduck_database or self.is_motherduck_attach
+
+    @staticmethod
+    def _is_motherduck(scheme: str) -> bool:
+        return scheme in MOTHERDUCK_SCHEMES
+
+    @staticmethod
+    def path_derived_database_name(path: Optional[Any]) -> str:
+        if path is None or path == ":memory:":
+            return "memory"
+        parsed = urlparse(str(path))
+        base_file = os.path.basename(parsed.path)
+        inferred_db_name = os.path.splitext(base_file)[0]
+        if DuckDBCredentials._is_motherduck(parsed.scheme):
+            if inferred_db_name == "":
+                inferred_db_name = "my_db"
+        elif parsed.scheme.lower() == "ducklake":
+            parsed_ducklake = urlparse(inferred_db_name)
+            inferred_db_name = parsed_ducklake.path
+        else:
+            # DuckDB names the catalog after the first non-empty dot-separated part
+            # of the file name, e.g. "my.db.duckdb" -> "my", ".hidden.duckdb" -> "hidden"
+            inferred_db_name = base_file.lstrip(".").split(".")[0]
+
+        return inferred_db_name
+
+    @staticmethod
+    def _is_duckdb_backed_attachment(attach_data: Dict[Any, Any]) -> bool:
+        """Whether DuckDB stores the catalog of this attachment itself, in which case an
+        unaliased attachment is registered under its path-derived name. The type may be
+        given either as the `type` field or as `options: {type: ...}`, as in to_sql()."""
+        attach_type = attach_data.get("type")
+        if attach_type is None:
+            options = attach_data.get("options")
+            if isinstance(options, dict):
+                attach_type = options.get("type")
+        if attach_type is None:
+            return True
+        return str(attach_type).lower() in DUCKDB_BACKED_ATTACHMENT_TYPES
+
+    @classmethod
+    def __pre_deserialize__(cls, data: Dict[Any, Any]) -> Dict[Any, Any]:
+        data = super().__pre_deserialize__(data)
+        path = data.get("path")
+        path_db_name = cls.path_derived_database_name(path)
+
+        # The database field may also name an attached database: by its alias, or, when
+        # no alias is given and the attachment is DuckDB-backed (no `type`, or one of
+        # DUCKDB_BACKED_ATTACHMENT_TYPES), by the name DuckDB derives from its path.
+        # Attachments of any other type must be aliased to be referred to here.
+        attached_db_names = []
+        for attach_data in data.get("attach") or []:
+            if not isinstance(attach_data, dict):
+                continue
+            if attach_data.get("alias"):
+                attached_db_names.append(attach_data["alias"])
+            elif attach_data.get("path") and cls._is_duckdb_backed_attachment(attach_data):
+                attached_db_names.append(cls.path_derived_database_name(attach_data["path"]))
+
+        database_from_data = data.get("database")
+        database_matches_attachment = database_from_data in attached_db_names
+
+        if path_db_name and "database" not in data:
+            data["database"] = path_db_name
+        elif path_db_name and data["database"] != path_db_name:
+            # Allow database name to differ from path_db if it names an attached database
+            if not data.get("remote") and not database_matches_attachment:
+                raise DbtRuntimeError(
+                    "Inconsistency detected between 'path' and 'database' fields in profile; "
+                    f"the 'database' property must be set to '{path_db_name}' to match the "
+                    "'path', or to the name of one of the attached databases"
+                )
+        elif not path_db_name:
+            raise DbtRuntimeError(
+                "Unable to determine target database name from 'path' field in profile"
+            )
+        return data
+
+    @property
+    def unique_field(self) -> str:
+        """
+        This property returns a unique field for the database connection.
+        If the connection is remote, it returns the host and port as a string.
+        If the connection is local, it returns the path and external root as a string.
+        """
+        if self.remote:
+            return self.remote.host + str(self.remote.port)
+        else:
+            return self.path + self.external_root
+
+    @property
+    def type(self):
+        return "duckdb"
+
+    def _connection_keys(self):
+        return (
+            "database",
+            "schema",
+            "path",
+            "config_options",
+            "extensions",
+            "settings",
+            "external_root",
+            "use_credential_provider",
+            "attach",
+            "filesystems",
+            "remote",
+            "plugins",
+            "disable_transactions",
+        )

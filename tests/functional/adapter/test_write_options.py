@@ -1,0 +1,230 @@
+import os
+import pytest
+from dbt.tests.adapter.basic.files import (
+    base_table_sql,
+    model_base,
+    schema_base_yml,
+    seeds_base_csv,
+)
+from dbt.tests.util import (
+    check_relation_types,
+    check_relations_equal,
+    check_result_nodes_by_name,
+    relation_from_name,
+    run_dbt,
+)
+
+config_write_csv_delim_options = """
+  {{ config(materialized="external", format="csv", options={"delimiter": "|"}) }}
+"""
+
+config_write_codec_options = """
+  {{ config(materialized="external", options={"codec": "zstd"}) }}
+"""
+
+config_write_partition_by_id = """
+    {{ config(materialized="external", options={"partition_by": "id", "codec": "zstd"}) }}
+"""
+
+config_write_partition_by_id_name = """
+    {{ config(materialized="external", options={"partition_by": "id, name"}) }}
+"""
+
+config_write_compressed_csv_location = """
+    {{ config(materialized="external", location="{{ adapter.external_root() }}/compressed.csv.gz") }}
+"""
+
+csv_delim_options_sql = config_write_csv_delim_options + model_base
+write_codec_options = config_write_codec_options + model_base
+config_write_partition_by_id_sql = config_write_partition_by_id + model_base
+config_write_partition_by_id_name_sql = config_write_partition_by_id_name + model_base
+config_write_compressed_csv_location_sql = config_write_compressed_csv_location + model_base
+
+config_write_upper_compressed_csv_location = """
+    {{ config(materialized="external", location="{{ adapter.external_root() }}/UPPER.CSV.GZ") }}
+"""
+config_write_upper_compressed_csv_location_sql = config_write_upper_compressed_csv_location + model_base
+
+# DuckDB's COPY options are case-insensitive, so upper-case option names must work too
+config_write_upper_partition_by = """
+    {{ config(materialized="external", options={"PARTITION_BY": "id, name", "CODEC": "zstd"}) }}
+"""
+config_write_upper_partition_by_sql = config_write_upper_partition_by + model_base
+
+config_write_upper_format = """
+    {{ config(materialized="external", options={"FORMAT": "csv", "DELIMITER": "|"}) }}
+"""
+config_write_upper_format_sql = config_write_upper_format + model_base
+
+# DuckDB appends the compression extension to each CSV or JSON file it writes, so the
+# view over a partitioned or per-thread output has to look for "*.csv.gz", not "*.csv"
+config_write_compressed_partition_by = """
+    {{ config(materialized="external", format="csv", options={"partition_by": "id", "compression": "gzip"}) }}
+"""
+config_write_compressed_partition_by_sql = config_write_compressed_partition_by + model_base
+
+config_write_compressed_per_thread_output = """
+    {{ config(materialized="external", format="json", options={"per_thread_output": "true", "compression": "zstd"}) }}
+"""
+config_write_compressed_per_thread_output_sql = config_write_compressed_per_thread_output + model_base
+
+
+class BaseExternalMaterializations:
+
+    @pytest.fixture(scope="class")
+    def dbt_profile_target(self, dbt_profile_target, tmp_path_factory):
+        extroot = str(tmp_path_factory.getbasetemp() / "write_options")
+        os.mkdir(extroot)
+        dbt_profile_target["external_root"] = extroot
+        return dbt_profile_target
+
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {
+            "table_model.sql": base_table_sql,
+            "csv_delim_options.sql": csv_delim_options_sql,
+            "write_codec_options.sql": write_codec_options,
+            "config_write_partition_by_id.sql": config_write_partition_by_id_sql,
+            "config_write_partition_by_id_name.sql": config_write_partition_by_id_name_sql,
+            "config_write_compressed_csv_location.sql": config_write_compressed_csv_location_sql,
+            "config_write_upper_compressed_csv_location.sql": config_write_upper_compressed_csv_location_sql,
+            "config_write_upper_partition_by.sql": config_write_upper_partition_by_sql,
+            "config_write_upper_format.sql": config_write_upper_format_sql,
+            "config_write_compressed_partition_by.sql": config_write_compressed_partition_by_sql,
+            "config_write_compressed_per_thread_output.sql": config_write_compressed_per_thread_output_sql,
+            "schema.yml": schema_base_yml,
+        }
+
+    @pytest.fixture(scope="class")
+    def seeds(self):
+        return {
+            "base.csv": seeds_base_csv,
+        }
+
+    @pytest.fixture(scope="class")
+    def project_config_update(self):
+        return {
+            "name": "base",
+        }
+
+    def test_base(self, project):
+
+        # seed command
+        results = run_dbt(["seed"])
+        # seed result length
+        assert len(results) == 1
+
+        # run command
+        results = run_dbt()
+        # run result length
+        assert len(results) == 11
+
+        # names exist in result nodes
+        check_result_nodes_by_name(
+            results,
+            [
+                "table_model",
+                "csv_delim_options",
+                "write_codec_options",
+                "config_write_partition_by_id",
+                "config_write_partition_by_id_name",
+                "config_write_compressed_csv_location",
+                "config_write_upper_compressed_csv_location",
+                "config_write_upper_partition_by",
+                "config_write_upper_format",
+                "config_write_compressed_partition_by",
+                "config_write_compressed_per_thread_output",
+            ],
+        )
+
+        # check relation types
+        expected = {
+            "base": "table",
+            "table_model": "table",
+            "csv_delim_options": "view",
+            "write_codec_options": "view",
+            "config_write_partition_by_id": "view",
+            "config_write_partition_by_id_name": "view",
+            "config_write_compressed_csv_location": "view",
+            "config_write_upper_compressed_csv_location": "view",
+            "config_write_upper_partition_by": "view",
+            "config_write_upper_format": "view",
+            "config_write_compressed_partition_by": "view",
+            "config_write_compressed_per_thread_output": "view",
+        }
+        check_relation_types(project.adapter, expected)
+
+        # base table rowcount
+        relation = relation_from_name(project.adapter, "base")
+        result = project.run_sql(f"select count(*) as num_rows from {relation}", fetch="one")
+        assert result[0] == 10
+
+        # relations_equal
+        check_relations_equal(
+            project.adapter,
+            [
+                "base",
+                "csv_delim_options",
+                "write_codec_options",
+                "config_write_partition_by_id",
+                "config_write_partition_by_id_name",
+                "config_write_compressed_csv_location",
+                "config_write_upper_compressed_csv_location",
+                "config_write_upper_partition_by",
+                "config_write_upper_format",
+                "config_write_compressed_partition_by",
+                "config_write_compressed_per_thread_output",
+            ],
+        )
+
+        # partitioned outputs default to a directory without a file extension
+        extroot = project.adapter.external_root()
+        assert os.path.isdir(os.path.join(extroot, "config_write_partition_by_id"))
+        assert os.path.isdir(os.path.join(extroot, "config_write_upper_partition_by"))
+
+        # check relations in catalog
+        catalog = run_dbt(["docs", "generate"])
+        assert len(catalog.nodes) == 12
+        assert len(catalog.sources) == 1
+
+
+class TestExternalMaterializations(BaseExternalMaterializations):
+    pass
+
+
+empty_partition_by_sql = """
+    {{ config(materialized="external", options={"partition_by": "id"}) }}
+    select 1 as id, 'a' as name where false
+"""
+
+empty_per_thread_output_sql = """
+    {{ config(materialized="external", options={"per_thread_output": true}) }}
+    select 1 as id, 'a' as name where false
+"""
+
+
+class TestEmptyGlobbedExternalMaterializations:
+    """Partitioned and per-thread outputs are read back through a glob, so an
+    empty result still needs the sentinel row to leave a file behind."""
+
+    @pytest.fixture(scope="class")
+    def dbt_profile_target(self, dbt_profile_target, tmp_path_factory):
+        extroot = str(tmp_path_factory.getbasetemp() / "empty_globbed")
+        os.mkdir(extroot)
+        dbt_profile_target["external_root"] = extroot
+        return dbt_profile_target
+
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {
+            "empty_partition_by.sql": empty_partition_by_sql,
+            "empty_per_thread_output.sql": empty_per_thread_output_sql,
+        }
+
+    def test_empty(self, project):
+        results = run_dbt()
+        assert len(results) == 2
+        for name in ("empty_partition_by", "empty_per_thread_output"):
+            relation = relation_from_name(project.adapter, name)
+            result = project.run_sql(f"select count(*) from {relation}", fetch="one")
+            assert result[0] == 0
